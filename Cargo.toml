@@ -1,0 +1,6 @@
+[workspace]
+members = ["apps/cirtam", "apps/cirtam-i", "crates/cirtam-core"]
+resolver = "2"
+
+[workspace.package]
+license = "MIT"

@@ -1,0 +1,17 @@
+[package]
+name = "cirtam"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+cirtam-core = { path = "../../crates/cirtam-core" }
+eframe = { version = "=0.31.1", default-features = false, features = ["default_fonts", "glow", "x11"] }
+rfd = "=0.15.4"
+getrandom = "0.3.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"

@@ -1,0 +1,80 @@
+{
+  "format": "cirtam",
+  "version": 1,
+  "circuit": {
+    "components": [
+      {
+        "kind": "Current",
+        "at": [
+          -4,
+          0
+        ],
+        "rotation": 3,
+        "label": "I1",
+        "value": 0.002
+      },
+      {
+        "kind": "Resistor",
+        "at": [
+          4,
+          0
+        ],
+        "rotation": 1,
+        "label": "R1",
+        "value": 1000
+      },
+      {
+        "kind": "Ground",
+        "at": [
+          0,
+          6
+        ],
+        "rotation": 1,
+        "label": "",
+        "value": 0
+      }
+    ],
+    "wires": [
+      [
+        [
+          -4,
+          -2
+        ],
+        [
+          4,
+          -2
+        ]
+      ],
+      [
+        [
+          -4,
+          2
+        ],
+        [
+          -4,
+          4
+        ]
+      ],
+      [
+        [
+          -4,
+          4
+        ],
+        [
+          4,
+          4
+        ]
+      ],
+      [
+        [
+          4,
+          4
+        ],
+        [
+          4,
+          2
+        ]
+      ]
+    ]
+  }
+}
