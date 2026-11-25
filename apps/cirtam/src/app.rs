@@ -1,18 +1,17 @@
-use crate::wiring::{self, Target};
+use crate::{
+    simulation::{self, Run, Sample, Settings, State},
+    simulation_ui,
+    wiring::{self, Target},
+};
 use cirtam_core::topology::Node;
 use cirtam_core::{
     circuit::{Circuit, Component, Kind, Point, Ratings},
     diagnostics::{Diagnostic, Location, Severity},
     persistence::{self, CIRTAM_EXTENSION},
-    solver::{self, Solution},
+    solver::Solution,
 };
 use eframe::egui::{self, Key};
-use std::{
-    collections::HashSet,
-    io::Write,
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::{collections::HashSet, io::Write, path::PathBuf, time::Duration};
 
 const CIRCUIT_CLIPBOARD_MARKER: &str = "Cirtam circuit selection";
 
@@ -32,7 +31,7 @@ pub enum Tool {
 
 pub enum Simulation {
     Design,
-    Results { solution: Solution },
+    Active(Run),
 }
 
 pub struct Details {
@@ -51,12 +50,13 @@ pub struct Editor {
     pub tool: Tool,
     pub route_corners: Vec<Point>,
     clipboard: Option<Circuit>,
-    pub simulation: Simulation,
+    simulation: Simulation,
+    sampling: Settings,
+    trace: simulation_ui::TraceSelection,
     cpu: crate::telemetry::CpuUsage,
     last_solve: Option<Duration>,
     pub view: crate::canvas::View,
     pub notice: String,
-    pub diagnostics: Vec<Diagnostic>,
     undo: Vec<Circuit>,
     redo: Vec<Circuit>,
     saved: Circuit,
@@ -86,11 +86,12 @@ impl Default for Editor {
             selection: HashSet::new(),
             tool: Tool::Select,
             simulation: Simulation::Design,
+            sampling: Settings::default(),
+            trace: simulation_ui::TraceSelection::default(),
             cpu: Default::default(),
             last_solve: None,
             view: Default::default(),
             notice: String::new(),
-            diagnostics: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             saved: circuit,
@@ -137,7 +138,6 @@ impl Editor {
     fn record_change(&mut self, old: Circuit) {
         if self.circuit != old {
             self.view.last_value_click = None;
-            self.diagnostics.clear();
             self.undo.push(old);
             self.redo.clear();
         }
@@ -152,7 +152,6 @@ impl Editor {
         if let Some(circuit) = from.pop() {
             to.push(std::mem::replace(&mut self.circuit, circuit));
             self.clear_interaction();
-            self.diagnostics.clear();
         }
     }
 
@@ -198,28 +197,52 @@ impl Editor {
     }
 
     fn run(&mut self) {
-        if !self.design() {
+        if let Simulation::Active(run) = &mut self.simulation {
+            run.resume();
             return;
         }
         if self.routing() {
             self.notice = "Finish the wire or press Esc to cancel before running.".into();
             return;
         }
-        let start = Instant::now();
-        let result = solver::solve(&self.circuit);
-        self.last_solve = Some(start.elapsed());
-        match result {
-            Ok(mut solution) => {
-                self.diagnostics = std::mem::take(&mut solution.diagnostics);
+        match Run::start(self.circuit.clone(), &self.sampling) {
+            Ok(run) => {
                 self.clear_interaction();
                 self.notice.clear();
-                self.simulation = Simulation::Results { solution };
+                self.trace = simulation_ui::TraceSelection::default();
+                self.simulation = Simulation::Active(run);
             }
-            Err(diagnostics) => {
-                self.notice.clear();
-                self.diagnostics = diagnostics;
+            Err(error) => self.notice = error,
+        }
+    }
+
+    fn poll_run(&mut self) {
+        if let Simulation::Active(run) = &mut self.simulation {
+            run.poll();
+            if let Some(duration) = run.snapshot.solve_duration {
+                self.last_solve = Some(duration);
             }
         }
+    }
+
+    fn active_run(&self) -> Option<&Run> {
+        match &self.simulation {
+            Simulation::Active(run) => Some(run),
+            Simulation::Design => None,
+        }
+    }
+
+    pub(crate) fn latest_sample(&self) -> Option<&Sample> {
+        self.active_run()?.snapshot.latest.as_ref()
+    }
+
+    pub fn solution(&self) -> Option<&Solution> {
+        Some(&self.latest_sample()?.solution)
+    }
+
+    pub fn current_diagnostics(&self) -> &[Diagnostic] {
+        self.active_run()
+            .map_or(&[], |run| run.snapshot.diagnostics.as_slice())
     }
 
     fn stop(&mut self) {
@@ -231,7 +254,11 @@ impl Editor {
     }
 
     pub fn open_details(&mut self, index: usize, focus_value: bool) {
-        let c = &self.circuit.components[index];
+        let c = self
+            .latest_sample()
+            .map_or(&self.circuit.components[index], |sample| {
+                &sample.circuit.components[index]
+            });
         self.details = Some(Details {
             index,
             label: c.label.clone(),
@@ -260,6 +287,7 @@ impl Editor {
         let mut open = true;
         let mut apply = false;
         let mut cancel = false;
+        let mut queue_source = false;
         egui::Window::new(kind.name())
             .id(egui::Id::new("component-details"))
             .default_pos(ctx.available_rect().right_top() + egui::vec2(-295.0, 24.0))
@@ -325,7 +353,34 @@ impl Editor {
                     if let Some(error) = &details.error {
                         ui.colored_label(ui.visuals().error_fg_color, error);
                     }
-                } else if let Simulation::Results { solution, .. } = &self.simulation {
+                } else {
+                    if self.active_run().is_some_and(Run::can_edit_sources) && simulation::is_live_source(kind) {
+                        ui.horizontal(|ui| {
+                            ui.label("Live source value");
+                            ui.add(egui::TextEdit::singleline(&mut details.value).desired_width(90.0));
+                            ui.label(kind.unit().unwrap_or(""));
+                        });
+                        queue_source = ui.button("Queue for next step").clicked();
+                        if let Some(error) = &details.error {
+                            ui.colored_label(ui.visuals().error_fg_color, error);
+                        }
+                    }
+                    let failed = self.active_run().is_some_and(|run| run.snapshot.state == State::Failed);
+                    let Some(sample) = self.latest_sample() else {
+                        ui.label(if failed {
+                            "DC solve failed before the first reading. See Diagnostics."
+                        } else {
+                            "Waiting for a DC reading."
+                        });
+                        return;
+                    };
+                    let c = &sample.circuit.components[details.index];
+                    let solution = &sample.solution;
+                    let label = if failed { "Last good reading" } else { "Reading" };
+                    ui.monospace(format!("{label} at {:.9} s", sample.time));
+                    if simulation::is_live_source(kind) {
+                        ui.label(format!("Applied source value  {} {}", display_metric(c.value), kind.unit().unwrap_or("")));
+                    }
                     if !c.label.is_empty() {
                         ui.label(&c.label);
                     }
@@ -375,6 +430,20 @@ impl Editor {
         if open && !cancel {
             if apply {
                 self.apply_details(&mut details);
+            }
+            if queue_source {
+                if let Some(run) = self.active_run() {
+                    match kind
+                        .parse_value(&details.value)
+                        .and_then(|value| run.queue_source(details.index, value))
+                    {
+                        Ok(()) => {
+                            details.error = None;
+                            self.notice = "Live source edit queued.".into();
+                        }
+                        Err(error) => details.error = Some(error),
+                    }
+                }
             }
             self.details = Some(details);
         }
@@ -480,7 +549,6 @@ impl Editor {
         circuit.make_connections_explicit();
         self.saved = circuit.clone();
         self.circuit = circuit;
-        self.diagnostics.clear();
         self.path = path;
         self.undo.clear();
         self.redo.clear();
@@ -673,11 +741,23 @@ impl Editor {
                         self.history(true);
                     }
                 });
+                let paused = self
+                    .active_run()
+                    .is_some_and(|run| run.snapshot.state == State::Paused);
                 if ui
-                    .add_enabled(self.design(), egui::Button::new("Run"))
+                    .add_enabled(self.design() || paused, egui::Button::new("Run"))
                     .clicked()
                 {
                     self.run();
+                }
+                if let Simulation::Active(run) = &mut self.simulation {
+                    let can_pause = run.snapshot.state == State::Running && !run.pause_pending;
+                    if ui
+                        .add_enabled(can_pause, egui::Button::new("Pause"))
+                        .clicked()
+                    {
+                        run.pause();
+                    }
                 }
                 if ui
                     .add_enabled(!self.design(), egui::Button::new("Stop"))
@@ -698,6 +778,7 @@ impl Editor {
                 }
             });
             if self.design() {
+                simulation_ui::settings(ui, &mut self.sampling);
                 ui.horizontal_wrapped(|ui| {
                     ui.add_enabled_ui(!self.routing(), |ui| self.design_tools(ui));
                 });
@@ -874,7 +955,7 @@ impl Editor {
     }
 
     fn diagnostics_window(&mut self, ctx: &egui::Context, workspace: egui::Rect) {
-        if self.diagnostics.is_empty() {
+        if self.current_diagnostics().is_empty() {
             return;
         }
         let mut focus = None;
@@ -889,7 +970,7 @@ impl Editor {
                 egui::ScrollArea::vertical()
                     .max_height(height)
                     .show(ui, |ui| {
-                        for diagnostic in &self.diagnostics {
+                        for diagnostic in self.current_diagnostics() {
                             let severity = match diagnostic.severity {
                                 Severity::Serious => "Serious warning",
                                 Severity::Warning => "Warning",
@@ -956,6 +1037,25 @@ impl Editor {
                 );
                 ui.monospace(solve);
                 ui.separator();
+                if let Some(run) = self.active_run() {
+                    ui.monospace(if run.pause_pending {
+                        "Pausing"
+                    } else {
+                        run.snapshot.state.label()
+                    });
+                    if let Some(sample) = &run.snapshot.latest {
+                        let label = if run.snapshot.state == State::Failed {
+                            "Last good step"
+                        } else {
+                            "Step"
+                        };
+                        ui.monospace(format!("{label} {} · {:.9} s", sample.step, sample.time));
+                    }
+                    if let Some(time) = run.snapshot.failed_time {
+                        ui.monospace(format!("Solve failed at {time:.9} s"));
+                    }
+                    ui.separator();
+                }
                 ui.monospace(format!("Zoom {:.0}%", self.view.zoom_percent()));
                 ui.separator();
                 ui.monospace(if self.circuit != self.saved {
@@ -1010,6 +1110,7 @@ impl Editor {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.pending = Some(FileAction::Close);
         }
+        self.poll_run();
         let had_keyboard_focus = self.other_keyboard_focus(ctx);
         self.top(ctx);
         self.cpu.sample();
@@ -1020,6 +1121,10 @@ impl Editor {
             .show(ctx, |ui| crate::canvas::show(self, ui))
             .response
             .rect;
+        if let Simulation::Active(run) = &self.simulation {
+            self.trace
+                .show(ctx, workspace, &self.circuit, &run.snapshot);
+        }
         self.diagnostics_window(ctx, workspace);
         self.details_window(ctx);
         if !had_keyboard_focus {
@@ -1042,6 +1147,12 @@ impl Editor {
             }
         }
         self.confirm(ctx);
+        if self
+            .active_run()
+            .is_some_and(|run| run.snapshot.state == State::Running)
+        {
+            ctx.request_repaint_after(simulation::REFRESH);
+        }
     }
 }
 
@@ -1165,6 +1276,7 @@ pub fn display_number(value: f64) -> String {
 #[cfg(test)]
 mod interaction_tests {
     use super::*;
+    use cirtam_core::solver;
 
     fn frame(
         editor: &mut Editor,
@@ -1192,6 +1304,239 @@ mod interaction_tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         }
+    }
+
+    fn sample_ui_pass(
+        editor: &mut Editor,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 700.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| crate::canvas::show(editor, ui));
+                editor.details_window(ctx);
+            },
+        )
+    }
+
+    fn sample_ui_frame(editor: &mut Editor, ctx: &egui::Context) -> egui::FullOutput {
+        // Give Details a layout pass without changing the worker publication.
+        let _ = sample_ui_pass(editor, ctx, vec![]);
+        sample_ui_pass(editor, ctx, vec![])
+    }
+
+    fn shows_text(output: &egui::FullOutput, expected: &str) -> bool {
+        output.shapes.iter().any(|shape| {
+            matches!(
+                &shape.shape,
+                egui::Shape::Text(text) if text.galley.job.text == expected
+            )
+        })
+    }
+
+    fn wait_for_run(editor: &mut Editor, ready: impl Fn(&Run) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            editor.poll_run();
+            if editor.active_run().is_some_and(&ready) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "DC sampler did not publish expected results"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn live_source_caption_and_details_share_last_good_sample_until_stop() {
+        let ctx = egui::Context::default();
+        let mut editor = Editor {
+            circuit: persistence::decode(include_str!("../../../examples/divider.crtm")).unwrap(),
+            sampling: Settings {
+                mode: simulation::Mode::Live,
+                timestep: 60.0,
+                ..Settings::default()
+            },
+            ..Default::default()
+        };
+        editor.run();
+        editor.open_details(0, false);
+        let before = sample_ui_frame(&mut editor, &ctx);
+        assert!(shows_text(&before, "V1 · 10 V"));
+        assert!(shows_text(&before, "Waiting for a DC reading."));
+
+        wait_for_run(&mut editor, |run| run.snapshot.latest.is_some());
+        for (value, expected_state) in [(20.0, State::Running), (f64::MAX, State::Failed)] {
+            let Simulation::Active(run) = &mut editor.simulation else {
+                panic!("expected active Live run")
+            };
+            run.pause();
+            wait_for_run(&mut editor, |run| run.snapshot.state == State::Paused);
+            editor.active_run().unwrap().queue_source(0, value).unwrap();
+            editor.run();
+            wait_for_run(&mut editor, |run| {
+                run.snapshot.state == expected_state
+                    && run
+                        .snapshot
+                        .latest
+                        .as_ref()
+                        .is_some_and(|sample| sample.time == 60.0)
+            });
+
+            let output = sample_ui_frame(&mut editor, &ctx);
+            assert!(shows_text(&output, "V1 · 20 V"));
+            assert!(shows_text(&output, "Applied source value  20 V"));
+            assert!(!shows_text(&output, "V1 · 10 V"));
+            if expected_state == State::Failed {
+                assert!(shows_text(&output, "Last good reading at 60.000000000 s"));
+            } else {
+                assert!(shows_text(&output, "Reading at 60.000000000 s"));
+            }
+        }
+        editor.stop();
+        let design = sample_ui_frame(&mut editor, &ctx);
+        assert!(shows_text(&design, "V1 · 10 V"));
+        assert!(!shows_text(&design, "V1 · 20 V"));
+    }
+
+    #[test]
+    fn live_source_caption_hit_matches_the_displayed_width() {
+        let ctx = egui::Context::default();
+        let mut editor = Editor {
+            circuit: persistence::decode(include_str!("../../../examples/divider.crtm")).unwrap(),
+            sampling: Settings {
+                mode: simulation::Mode::Live,
+                timestep: 60.0,
+                ..Settings::default()
+            },
+            ..Default::default()
+        };
+        let caption_rect = |output: &egui::FullOutput, caption: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == caption => {
+                        Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing caption {caption}"))
+        };
+        let click = |editor: &mut Editor, pos: egui::Pos2, button: egui::PointerButton| {
+            for pressed in [true, false] {
+                sample_ui_pass(
+                    editor,
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        };
+        let change_source = |editor: &mut Editor, value: f64| {
+            let Simulation::Active(run) = &mut editor.simulation else {
+                panic!("expected Live run")
+            };
+            run.pause();
+            wait_for_run(editor, |run| run.snapshot.state == State::Paused);
+            editor.active_run().unwrap().queue_source(0, value).unwrap();
+            editor.run();
+            wait_for_run(editor, |run| {
+                run.snapshot
+                    .latest
+                    .as_ref()
+                    .is_some_and(|sample| sample.circuit.components[0].value == value)
+            });
+        };
+
+        editor.run();
+        let design_caption = caption_rect(&sample_ui_frame(&mut editor, &ctx), "V1 · 10 V");
+        click(
+            &mut editor,
+            design_caption.center(),
+            egui::PointerButton::Primary,
+        );
+        assert_eq!(editor.details.take().unwrap().index, 0);
+        wait_for_run(&mut editor, |run| run.snapshot.latest.is_some());
+
+        change_source(&mut editor, 1.234567);
+        let wider = caption_rect(&sample_ui_frame(&mut editor, &ctx), "V1 · 1.234567 V");
+        assert!(wider.right() > design_caption.right());
+        let new_text = egui::pos2(
+            (wider.right() + design_caption.right()) * 0.5,
+            wider.center().y,
+        );
+        click(&mut editor, new_text, egui::PointerButton::Primary);
+        let details = editor
+            .details
+            .take()
+            .expect("clicking the expanded caption opens Details");
+        assert_eq!(details.index, 0);
+        assert_eq!(details.value, "1.234567");
+
+        change_source(&mut editor, 1.0);
+        let narrower = caption_rect(&sample_ui_frame(&mut editor, &ctx), "V1 · 1 V");
+        assert!(narrower.right() < design_caption.right());
+        let hidden = egui::pos2(
+            (narrower.right() + design_caption.right()) * 0.5,
+            narrower.center().y,
+        );
+        click(&mut editor, hidden, egui::PointerButton::Primary);
+        assert!(
+            editor.details.is_none(),
+            "the old caption area should not open Details"
+        );
+
+        editor.stop();
+        let _ = sample_ui_frame(&mut editor, &ctx);
+        click(&mut editor, hidden, egui::PointerButton::Secondary);
+        let details = editor
+            .details
+            .take()
+            .expect("the design caption is clickable after Stop");
+        assert_eq!(details.index, 0);
+        assert_eq!(details.value, "10");
+    }
+
+    #[test]
+    fn details_distinguishes_pending_reading_from_failed_first_solve() {
+        let ctx = egui::Context::default();
+        let mut editor = Editor::default();
+        wiring::add_component(
+            &mut editor.circuit,
+            Component::new(Kind::Resistor, Point(0, 0)),
+        )
+        .unwrap();
+        editor.run();
+        editor.open_details(0, false);
+        assert!(shows_text(
+            &sample_ui_frame(&mut editor, &ctx),
+            "Waiting for a DC reading."
+        ));
+        wait_for_run(&mut editor, |run| run.snapshot.state == State::Failed);
+        let output = sample_ui_frame(&mut editor, &ctx);
+        assert!(shows_text(
+            &output,
+            "DC solve failed before the first reading. See Diagnostics."
+        ));
+        assert!(!shows_text(&output, "Waiting for a DC reading."));
     }
 
     #[test]
@@ -1556,7 +1901,15 @@ mod interaction_tests {
         let ctx = egui::Context::default();
         let mut editor = Editor::default();
         editor.run();
-        frame(&mut editor, &ctx, vec![]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while editor.current_diagnostics().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "DC diagnostics did not arrive"
+            );
+            frame(&mut editor, &ctx, vec![]);
+            std::thread::yield_now();
+        }
         frame(&mut editor, &ctx, vec![]);
         let bounds = ctx
             .memory(|memory| memory.area_rect(egui::Id::new("diagnostics-window")))

@@ -4,6 +4,8 @@ mod canvas;
 mod canvas_tests;
 mod palette;
 mod resistance;
+mod simulation;
+mod simulation_ui;
 mod telemetry;
 mod wiring;
 

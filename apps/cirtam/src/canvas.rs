@@ -1,4 +1,4 @@
-use crate::app::{display_metric, Editor, Item, Simulation, Tool};
+use crate::app::{display_metric, Editor, Item, Tool};
 use crate::wiring::{self, Target};
 use cirtam_core::{
     circuit::{Circuit, Component, Kind, Point, Wire},
@@ -161,10 +161,24 @@ fn caption_bounds(painter: &Painter, t: Transform, c: &Component) -> Rect {
     Align2::CENTER_TOP.anchor_size(caption_pos(t, c, Point::default()), galley.size())
 }
 
+fn displayed_component<'a>(
+    editor: &'a Editor,
+    index: usize,
+    design: &'a Component,
+) -> &'a Component {
+    if crate::simulation::is_live_source(design.kind) {
+        editor
+            .latest_sample()
+            .map_or(design, |sample| &sample.circuit.components[index])
+    } else {
+        design
+    }
+}
+
 fn hit(editor: &Editor, painter: &Painter, t: Transform, pos: Pos2) -> Option<Item> {
     for (i, c) in editor.circuit.components.iter().enumerate().rev() {
         if component_bounds(t, c, Point::default()).contains(pos)
-            || caption_bounds(painter, t, c).contains(pos)
+            || caption_bounds(painter, t, displayed_component(editor, i, c)).contains(pos)
         {
             return Some(Item::Component(i));
         }
@@ -646,12 +660,12 @@ fn draw(editor: &Editor, painter: &Painter, rect: Rect, t: Transform) {
         draw_component(
             painter,
             t,
-            c,
+            displayed_component(editor, i, c),
             Point::default(),
             color,
             highlights.get(&item).copied(),
         );
-        if let Simulation::Results { solution, .. } = &editor.simulation {
+        if let Some(solution) = editor.solution() {
             let reading = solution.readings[i];
             let result = match c.kind {
                 Kind::Voltmeter => Some(format!("{} V", display_metric(reading.voltage))),
@@ -757,7 +771,7 @@ fn draw(editor: &Editor, painter: &Painter, rect: Rect, t: Transform) {
 
 fn diagnostic_highlights(editor: &Editor, painter: &Painter) -> HashMap<Item, Color32> {
     let mut severities = HashMap::<Item, Severity>::new();
-    for diagnostic in &editor.diagnostics {
+    for diagnostic in editor.current_diagnostics() {
         let item = match diagnostic.location {
             Some(Location::Component(index)) => Item::Component(index),
             Some(Location::Wire(index)) => Item::Wire(index),
